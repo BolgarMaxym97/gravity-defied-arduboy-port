@@ -68,6 +68,8 @@ int main(int argc, char **argv) {
   }
 
   int bestGen = -1, bestIdx = -1;
+  Node winner{};              // сам вузол-переможець, а не індекс у next:
+  bool found = false;         // next нижче сортується, і індекс протухає
   int16_t reached = 0;
 
   for (int g = 0; g < STEPS && bestGen < 0; g++) {
@@ -92,9 +94,17 @@ int main(int argc, char **argv) {
         n.score = (int32_t)x * 64 + (n.b.rear.x - n.b.rear.px);
         next.push_back(n);
 
-        if (x >= finishX) { bestGen = g + 1; bestIdx = (int)next.size() - 1; break; }
+        if (x >= finishX) { bestGen = g + 1; winner = n; found = true; break; }
       }
-      if (bestGen >= 0) break;
+      if (found) break;
+    }
+
+    // Фініш обробляємо ДО сортування: після нього будь-який збережений
+    // індекс указує вже на інший вузол.
+    if (found) {
+      gens.push_back({ winner });
+      bestIdx = 0;
+      break;
     }
 
     if (next.empty()) {
@@ -119,7 +129,6 @@ int main(int argc, char **argv) {
     }
 
     gens.push_back(std::move(pruned));
-    if (bestGen >= 0) { gens.back() = { next[bestIdx] }; bestIdx = 0; }
   }
 
   printf("=== рівень %d, фініш %d px ===\n", li, finishX);
@@ -141,6 +150,27 @@ int main(int argc, char **argv) {
     idx = gens[g][idx].parent;
   }
   std::reverse(path.begin(), path.end());
+
+  // Переграємо знайдену послідовність з нуля. Без цієї перевірки помилка
+  // в обліку променя (індекс у відсортованому масиві, зіпсований parent)
+  // вилазить як «рішення», якого насправді немає.
+  {
+    Bike v;
+    bikeInit(v, tun, fpFromInt(20), fpFromInt(startY));
+    int frames = 0;
+    for (uint8_t a : path) {
+      Input in{ ACTS[a].gas, ACTS[a].brake, ACTS[a].l, ACTS[a].r };
+      for (int f = 0; f < HOLD; f++) { bikeStep(v, ter, tun, in); frames++; }
+      if (v.crashed) break;
+    }
+    int16_t x = fpToInt(v.rear.x);
+    if (v.crashed || x < finishX) {
+      printf("ПЕРЕВІРКА ПРОВАЛЕНА: переграванням дійшли лише до %d/%d px%s\n",
+             x, finishX, v.crashed ? " (краш)" : "");
+      return 2;
+    }
+    printf("Перевірено переграванням: %d кадрів, x=%d\n", frames, x);
+  }
 
   printf("Лінія (по %d кадрів на символ): ", HOLD);
   const char *sym = "G<>.LRB{";

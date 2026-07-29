@@ -1,30 +1,33 @@
 #include <Arduboy2.h>
+#include <ArduboyTones.h>
 #include <EEPROM.h>
 #include "gd_core.h"
 #include "bike_sprite.h"
 #include "levels.h"
 #include "tinyfont.h"
 #include "records.h"
-
-// Ядро фізики живе в namespace gd. Це не косметика: Arduboy2.h визначає
-// власний struct Point, і без ізоляції відбувається колізія імен, при якій
-// компілятор мовчки бере чужий тип.
-using gd::Terrain;
-using gd::BikeTuning;
-using gd::Bike;
-using gd::Input;
-using gd::DEFAULT_TUNING;
-using gd::bikeInit;
-using gd::bikeStep;
-using gd::bikeAxes;
+#include "music.h"
+#include "game_types.h"
 
 // Адаптер під залізо. Уся фізика — в gd_core.h і про Arduboy нічого не знає.
 // Завдяки цьому та сама логіка ганяється в десктопному симуляторі.
 
 Arduboy2 arduboy;
+ArduboyTones sound(arduboy.audio.enabled);
 
 BikeTuning tun = DEFAULT_TUNING;
 Bike       bike;
+
+// --------------------------- Швидкість байка -------------------------------
+// ЄДИНА ручка швидкості: максимальна швидкість на рівному при повному газі,
+// у пікселях за кадр (60 кадрів/с). 6 -> ~5.7 px/кадр -> ~345 px/с.
+// Прискорення й тяга рахуються від неї, тому міняти треба лише це число.
+//
+// Розумний діапазон 4..9. Нижче їзда стає в'язкою. Вище — два наслідки:
+// на схилах крутіше 33° швидкість усе одно впирається в зчеплення, а не
+// в двигун, і байк починає перестрибувати короткі сегменти ландшафту
+// між кадрами (сегменти в рівнях від 8 px завдовжки).
+constexpr uint8_t BIKE_TOP_SPEED = 6;
 
 // --------------------------- Рівні -----------------------------------------
 // levelData() — у levels.h, згенерованому tools/genlevel.py. Там switch,
@@ -41,8 +44,15 @@ void loadLevel(uint8_t i) {
   ter.count = lvl.count;
 }
 
-enum class St : uint8_t { Title, Play, Crash, Win };
-St st = St::Title;
+// Типи стану — в game_types.h: збирач Arduino вставляє згенеровані прототипи
+// перед кодом скетчу, тож усе, що з'являється в сигнатурах, мусить бути
+// оголошене в заголовку.
+St st = St::Splash;
+
+uint8_t menuSel;
+uint8_t listSel;    // у списку рівнів: 0..LEVEL_COUNT-1 рівні, LEVEL_COUNT = BACK
+uint8_t listTop;    // перший видимий рядок списку
+uint8_t optSel;     // 0 = SOUND, 1 = BACK
 
 uint16_t frames;      // час проходження, скидається на старті рівня
 uint16_t tick;        // тікає завжди — для миготіння тексту й світлодіода
@@ -86,6 +96,7 @@ void updateCamera(bool snap) {
 }
 
 void startLevel() {
+  sound.noTone();          // музика меню й двигун — один голос, див. music.h
   loadLevel(lvlIndex);
   bikeInit(bike, tun, fpFromInt(START_X), fpFromInt(lvl.startY));
   frames = 0;
@@ -95,8 +106,8 @@ void startLevel() {
   st = St::Play;
 }
 
-void toTitle() {
-  st = St::Title;
+void toMenu() {
+  st = St::Menu;
   arduboy.digitalWriteRGB(RED_LED, RGB_OFF);
 }
 
@@ -106,31 +117,45 @@ void toTitle() {
 // (tinyfont.h, згенерований tools/genfont.py). Заголовок лишається штатним
 // шрифтом — на цьому контрасті й тримається ієрархія екрана.
 
-uint8_t tinyWidth(const char *s) {
+// Перевантаження, а не аргументи за замовчуванням: збирач Arduino генерує
+// прототипи для функцій скетчу, і значення за замовчуванням опинилися б
+// одночасно в прототипі й у визначенні — це помилка компіляції.
+uint8_t tinyWidth(const char *s, uint8_t scale) {
   uint8_t n = 0;
   while (*s++) n++;
-  return n ? n * TINY_ADV - 1 : 0;
+  return n ? n * TINY_ADV * scale - scale : 0;
 }
 
-void tinyChar(int16_t x, int16_t y, char c) {
+uint8_t tinyWidth(const char *s) { return tinyWidth(s, 1); }
+
+void tinyChar(int16_t x, int16_t y, char c, uint8_t scale) {
   if (c >= 'a' && c <= 'z') c -= 32;               // шрифт тільки великий
   if (c < TINY_FIRST || c > TINY_LAST) c = ' ';
   const uint8_t *g = &TINY_FONT[(uint8_t)(c - TINY_FIRST) * TINY_W];
   for (uint8_t cx = 0; cx < TINY_W; cx++) {
     uint8_t col = pgm_read_byte(&g[cx]);
     for (uint8_t ry = 0; ry < TINY_H; ry++) {
-      if (col & (1 << ry)) arduboy.drawPixel(x + cx, y + ry, WHITE);
+      if (!(col & (1 << ry))) continue;
+      if (scale == 1) {
+        arduboy.drawPixel(x + cx, y + ry, WHITE);
+      } else {
+        arduboy.fillRect(x + cx * scale, y + ry * scale, scale, scale, WHITE);
+      }
     }
   }
 }
 
-void tinyPrint(int16_t x, int16_t y, const char *s) {
-  while (*s) { tinyChar(x, y, *s++); x += TINY_ADV; }
+void tinyPrint(int16_t x, int16_t y, const char *s, uint8_t scale) {
+  while (*s) { tinyChar(x, y, *s++, scale); x += TINY_ADV * scale; }
 }
 
-void tinyCenter(int16_t y, const char *s) {
-  tinyPrint((128 - tinyWidth(s)) / 2, y, s);
+void tinyPrint(int16_t x, int16_t y, const char *s) { tinyPrint(x, y, s, 1); }
+
+void tinyCenter(int16_t y, const char *s, uint8_t scale) {
+  tinyPrint((128 - tinyWidth(s, scale)) / 2, y, s, scale);
 }
+
+void tinyCenter(int16_t y, const char *s) { tinyCenter(y, s, 1); }
 
 // Своє форматування замість snprintf: той тягне ~1.5 КБ флешу заради
 // двох чисел.
@@ -167,14 +192,12 @@ void drawWheel(int16_t cx, int16_t cy, uint8_t phase) {
   arduboy.drawPixel(cx, cy, WHITE);
 }
 
-void drawBike() {
-  fp ux32, uy32;
-  if (!bikeAxes(bike, ux32, uy32)) return;
-
+// Малює мотоцикл у довільній позі. Винесено з drawBike(), бо тим самим
+// кодом малюється сплеш — інакше заставка жила б власним життям і розійшлася
+// б із грою після першої ж правки рами.
+void drawBikeAt(int16_t rx, int16_t ry, int16_t ux, int16_t uy, uint8_t phase) {
   int16_t px[gd::P_COUNT], py[gd::P_COUNT];
-  gd::bikeProject(fpRound(bike.rear.x) - camX,
-                  fpRound(bike.rear.y) - camY,
-                  (int16_t)ux32, (int16_t)uy32, px, py);
+  gd::bikeProject(rx, ry, ux, uy, px, py);
 
   for (uint8_t i = 0; i < gd::BIKE_LINE_COUNT; i++) {
     uint8_t a = pgm_read_byte(&gd::BIKE_LINES[i * 2]);
@@ -182,12 +205,18 @@ void drawBike() {
     arduboy.drawLine(px[a], py[a], px[b], py[b], WHITE);
   }
 
-  uint8_t phase = gd::bikeSpokePhase(bike.spin);
   drawWheel(px[gd::P_RAXLE], py[gd::P_RAXLE], phase);
   drawWheel(px[gd::P_FAXLE], py[gd::P_FAXLE], phase);
 
   // Голова — кружечок r=1, щоб райдер читався як людина, а не як паличка.
   arduboy.drawCircle(px[gd::P_HEAD], py[gd::P_HEAD], 1, WHITE);
+}
+
+void drawBike() {
+  fp ux, uy;
+  if (!bikeAxes(bike, ux, uy)) return;
+  drawBikeAt(fpRound(bike.rear.x) - camX, fpRound(bike.rear.y) - camY,
+             (int16_t)ux, (int16_t)uy, gd::bikeSpokePhase(bike.spin));
 }
 
 // --------------------------- Рендер ландшафту ------------------------------
@@ -288,51 +317,248 @@ const char *difficultyName(uint8_t i) {
   return "BRUTAL";
 }
 
-void drawTitle() {
-  // Заголовок — штатний 5x7. Усе інше дрібним 3x5: різниця в розмірі і
-  // створює ієрархію, якої не було, коли все йшло одним кеглем.
+// Заставка. Композиція один-в-один з tools/gentitle.py (title.png):
+// логотип у два рядки масштабом 3, мотоцикл у вілі праворуч, лінія землі.
+//
+// Малюємо кодом, а не бітмапом: PNG 128x64 коштував би 1024 байти флешу,
+// а тут усе вже є — шрифт, спрайт, лінії. Виходить близько 200 байт коду,
+// і заставка не може розійтися з грою, бо це буквально той самий спрайт.
+constexpr int16_t SPLASH_GROUND = 60;
+
+void drawSplash() {
+  tinyCenter(4,  "GRAVITY", 3);
+  tinyCenter(21, "DEFIED",  3);
+
+  arduboy.drawLine(0, SPLASH_GROUND, 127, SPLASH_GROUND, WHITE);
+  for (int16_t x = 0; x < 128; x += 4) {
+    arduboy.drawLine(x, SPLASH_GROUND + 1, x, 62, WHITE);
+  }
+
+  // -45°: cos/sin = 0.707 -> 181 у Q8.
+  drawBikeAt(100, SPLASH_GROUND - 4, 181, -181, 2);
+
+  tinyPrint(8, 50, "10 LEVELS");
+}
+
+// --------------------------- Екрани меню -----------------------------------
+
+// Шапка спільна для всіх меню: штатний 5x7 плюс підкреслення. Пункти нижче
+// йдуть дрібним шрифтом — на цьому контрасті й тримається ієрархія.
+void drawHeader() {
   arduboy.setTextSize(1);
   arduboy.setCursor(25, 3);
   arduboy.print(F("GRAVITY DEFIED"));
   arduboy.setCursor(25, 10);
   arduboy.print(F("______________"));
+}
 
-  char buf[24];
-  char *p = buf;
-  for (const char *q = "LEVEL "; *q; q++) *p++ = *q;
-  p = fmtNum(p, lvlIndex + 1);
+// Курсор ліворуч від пункту. Миготить, щоб було видно навіть на статичному
+// екрані, який пункт активний.
+void drawCursor(int16_t x, int16_t y, uint8_t scale) {
+  if ((tick >> 4) & 1) tinyPrint(x, y, ">", scale);
+}
+
+void drawMenu() {
+  drawHeader();
+
+  static const char *const ITEMS[MI_COUNT] = { "PLAY", "LEVELS", "OPTIONS" };
+  for (uint8_t i = 0; i < MI_COUNT; i++) {
+    int16_t y = 24 + i * 12;
+    uint8_t w = tinyWidth(ITEMS[i], 2);
+    int16_t x = (128 - w) / 2;
+    tinyPrint(x, y, ITEMS[i], 2);
+    if (i == menuSel) drawCursor(x - 14, y, 2);
+  }
+}
+
+// Рядок списку рівнів: "10  BRUTAL  12.3" або "--.-", якщо рекорду немає.
+void levelRow(char *p, uint8_t i) {
+  if (i + 1 < 10) *p++ = ' ';
+  p = fmtNum(p, i + 1);
   *p++ = ' ';
   *p++ = ' ';
-  for (const char *q = difficultyName(lvlIndex); *q; q++) *p++ = *q;
-  *p = 0;
-  tinyCenter(22, buf);
-
-  p = buf;
-  for (const char *q = "BEST "; *q; q++) *p++ = *q;
-  if (records[lvlIndex]) p = fmtTime(p, records[lvlIndex]);
+  const char *d = difficultyName(i);
+  uint8_t n = 0;
+  for (; *d; d++, n++) *p++ = *d;
+  while (n++ < 6) *p++ = ' ';          // вирівнювання колонки з часом
+  *p++ = ' ';
+  if (records[i]) p = fmtTime(p, records[i]);
   else { *p++ = '-'; *p++ = '-'; *p++ = '.'; *p++ = '-'; }
   *p = 0;
-  tinyCenter(30, buf);
+}
 
-  // Стрілки-підказки лише там, де є куди йти.
-  if (lvlIndex > 0)               tinyPrint(6, 22, "<");
-  if (lvlIndex + 1 < LEVEL_COUNT) tinyPrint(119, 22, ">");
+void drawLevels() {
+  tinyCenter(3, "SELECT LEVEL", 1);
+  arduboy.drawLine(20, 9, 107, 9, WHITE);
 
-  tinyCenter(42, "A=GAS  B=BRAKE/REVERSE");
-  tinyCenter(49, "<> = LEAN    v = MENU");
+  char buf[24];
+  for (uint8_t r = 0; r < LIST_ROWS; r++) {
+    uint8_t i = listTop + r;
+    if (i > LEVEL_COUNT) break;
+    int16_t y = 14 + r * 8;
 
-  if ((tick >> 5) & 1) tinyCenter(58, "A = START");
+    if (i == LEVEL_COUNT) tinyPrint(20, y, "BACK");
+    else { levelRow(buf, i); tinyPrint(20, y, buf); }
+
+    if (i == listSel) drawCursor(12, y, 1);
+  }
+
+  // Стрілки прокрутки: без них незрозуміло, що список довший за екран.
+  if (listTop > 0)                          tinyPrint(112, 14, "<");
+  if (listTop + LIST_ROWS <= LEVEL_COUNT)   tinyPrint(112, 46, ">");
+
+  tinyCenter(56, "A = SELECT   B = BACK");
+}
+
+void drawOptions() {
+  uint8_t w = tinyWidth("OPTIONS", 2);
+  tinyPrint((128 - w) / 2, 2, "OPTIONS", 2);
+
+  tinyPrint(24, 16, "SOUND");
+  tinyPrint(76, 16, arduboy.audio.enabled() ? "ON" : "OFF");
+  if (optSel == 0) drawCursor(14, 16, 1);
+
+  // Опис керування — те саме, що раніше тіснилося на титулці.
+  tinyPrint(14, 27, "A       GAS");
+  tinyPrint(14, 34, "B       BRAKE / REVERSE");
+  tinyPrint(14, 41, "< >     LEAN");
+  tinyPrint(14, 48, "v       BACK TO MENU");
+
+  tinyPrint(24, 57, "BACK");
+  if (optSel == 1) drawCursor(14, 57, 1);
 }
 
 // --------------------------- Life cycle ------------------------------------
 
 void setup() {
-  arduboy.begin();
+  arduboy.begin();                 // сам піднімає audio і читає його стан з EEPROM
   arduboy.setFrameRate(60);
   records.load(EEPROM_STORAGE_SPACE_START);
+
+  // Швидкість задається одним числом, решта рахується від неї.
+  tun.drive = gd::driveForTopSpeed(BIKE_TOP_SPEED, tun.damping);
+
   lvlIndex = 0;
+  menuSel = MI_PLAY;
+  listSel = listTop = 0;
+  optSel = 0;
   startLevel();
-  toTitle();
+  st = St::Splash;
+}
+
+// Звук двигуна. Один голос, тому це працює лише в грі: у меню той самий
+// канал зайнятий музикою.
+void engineSound(const Input &in) {
+  if (!arduboy.audio.enabled()) return;
+  if ((tick & 3) != 0) return;                 // ~15 разів на секунду
+
+  bool rolling = in.gas || in.brake;
+  if (!rolling || bike.crashed) { sound.noTone(); return; }
+
+  // Тон іде за швидкістю. Тривалість трохи довша за інтервал переграшу —
+  // інакше між викликами чути провали і звук стає деренчанням.
+  uint16_t f = 70 + speedShown * 3;
+  if (f > 520) f = 520;
+  if (!in.gas) f = f / 2 + 40;                 // задній хід нижчий і тихіший
+  sound.tone(f, 90);
+}
+
+void menuMusic() {
+  // TONES_REPEAT зациклює мелодію всередині бібліотеки, тож достатньо
+  // запустити її один раз — перевірка playing() і робить це один раз.
+  if (arduboy.audio.enabled() && !sound.playing()) sound.tones(MENU_MUSIC);
+}
+
+// --------------------------- Введення --------------------------------------
+
+void updateMenu() {
+  if (arduboy.justPressed(DOWN_BUTTON) && menuSel + 1 < MI_COUNT) menuSel++;
+  if (arduboy.justPressed(UP_BUTTON) && menuSel > 0) menuSel--;
+  if (!arduboy.justPressed(A_BUTTON)) return;
+
+  switch (menuSel) {
+    case MI_PLAY:
+      lvlIndex = 0;
+      sound.tones(SFX_START);
+      startLevel();
+      break;
+    case MI_LEVELS:
+      listSel = lvlIndex;
+      listTop = 0;
+      st = St::Levels;
+      break;
+    default:
+      optSel = 0;
+      st = St::Options;
+      break;
+  }
+}
+
+void updateLevels() {
+  if (arduboy.justPressed(DOWN_BUTTON) && listSel < LEVEL_COUNT) listSel++;
+  if (arduboy.justPressed(UP_BUTTON) && listSel > 0) listSel--;
+
+  // Прокрутка вікна за курсором.
+  if (listSel < listTop) listTop = listSel;
+  if (listSel >= listTop + LIST_ROWS) listTop = listSel - LIST_ROWS + 1;
+
+  if (arduboy.justPressed(B_BUTTON)) { toMenu(); return; }
+  if (!arduboy.justPressed(A_BUTTON)) return;
+
+  if (listSel >= LEVEL_COUNT) { toMenu(); return; }
+  lvlIndex = listSel;
+  sound.tones(SFX_START);
+  startLevel();
+}
+
+void updateOptions() {
+  if (arduboy.justPressed(DOWN_BUTTON) && optSel < 1) optSel++;
+  if (arduboy.justPressed(UP_BUTTON) && optSel > 0) optSel--;
+
+  bool toggle = arduboy.justPressed(LEFT_BUTTON) || arduboy.justPressed(RIGHT_BUTTON) ||
+                (optSel == 0 && arduboy.justPressed(A_BUTTON));
+  if (toggle) {
+    if (arduboy.audio.enabled()) { arduboy.audio.off(); sound.noTone(); }
+    else                          arduboy.audio.on();
+    arduboy.audio.saveOnOff();     // стан переживає вимкнення консолі
+  }
+
+  if (arduboy.justPressed(B_BUTTON) ||
+      (optSel == 1 && arduboy.justPressed(A_BUTTON))) toMenu();
+}
+
+void updatePlay() {
+  Input in;
+  in.gas       = arduboy.pressed(A_BUTTON);
+  in.brake     = arduboy.pressed(B_BUTTON);
+  in.leanLeft  = arduboy.pressed(LEFT_BUTTON);    // задирає ніс
+  in.leanRight = arduboy.pressed(RIGHT_BUTTON);   // опускає ніс
+
+  bikeStep(bike, ter, tun, in);
+  frames++;
+
+  if (bike.crashed) {
+    st = St::Crash;
+    sound.tones(SFX_CRASH);
+  } else if (fpToInt(bike.rear.x) >= lvl.finishX) {
+    st = St::Win;
+    newRecord = records.submit(lvlIndex, frames);
+    sound.tones(newRecord ? SFX_RECORD : SFX_FINISH);
+  } else {
+    engineSound(in);
+  }
+
+  if (arduboy.justPressed(DOWN_BUTTON)) { sound.noTone(); toMenu(); }
+}
+
+void updateEnd() {
+  if (arduboy.justPressed(DOWN_BUTTON)) { toMenu(); return; }
+  if (arduboy.justPressed(A_BUTTON)) { startLevel(); return; }
+  if (st == St::Win && arduboy.justPressed(RIGHT_BUTTON) &&
+      lvlIndex + 1 < LEVEL_COUNT) {
+    lvlIndex++;
+    startLevel();
+  }
 }
 
 void loop() {
@@ -340,74 +566,50 @@ void loop() {
   arduboy.pollButtons();
   tick++;
 
-  // Вихід у FX-меню: UP+DOWN 3 секунди, і тільки з титулки — у грі DOWN
-  // зайнятий поверненням у меню.
-  if (st == St::Title && arduboy.pressed(UP_BUTTON) && arduboy.pressed(DOWN_BUTTON)) {
+  // Вихід у FX-меню: UP+DOWN 3 секунди, і тільки з головного меню — скрізь
+  // інде DOWN зайнятий навігацією.
+  if (st == St::Menu && arduboy.pressed(UP_BUTTON) && arduboy.pressed(DOWN_BUTTON)) {
     if (++exitHold > 180) arduboy.exitToBootloader();
   } else {
     exitHold = 0;
   }
 
-  if (st == St::Play) {
-    Input in;
-    in.gas       = arduboy.pressed(A_BUTTON);
-    in.brake     = arduboy.pressed(B_BUTTON);
-    in.leanLeft  = arduboy.pressed(LEFT_BUTTON);    // задирає ніс
-    in.leanRight = arduboy.pressed(RIGHT_BUTTON);   // опускає ніс
-
-    bikeStep(bike, ter, tun, in);
-    frames++;
-
-    if (bike.crashed) {
-      st = St::Crash;
-    } else if (fpToInt(bike.rear.x) >= lvl.finishX) {
-      st = St::Win;
-      newRecord = records.submit(lvlIndex, frames);
+  if (st == St::Splash) {
+    if (tick > 150 || arduboy.justPressed(A_BUTTON) ||
+        arduboy.justPressed(B_BUTTON) || arduboy.justPressed(DOWN_BUTTON)) {
+      toMenu();
     }
-
-    if (arduboy.justPressed(DOWN_BUTTON)) toTitle();
-
-  } else if (st == St::Title) {
-    // Перемикання рівня перезапускає й мотоцикл — інакше він лишався б
-    // у координатах попереднього рівня, десь у порожнечі.
-    bool changed = false;
-    if (arduboy.justPressed(RIGHT_BUTTON) && lvlIndex + 1 < LEVEL_COUNT) {
-      lvlIndex++; changed = true;
-    }
-    if (arduboy.justPressed(LEFT_BUTTON) && lvlIndex > 0) {
-      lvlIndex--; changed = true;
-    }
-    if (changed) {
-      loadLevel(lvlIndex);
-      bikeInit(bike, tun, fpFromInt(START_X), fpFromInt(lvl.startY));
-      updateCamera(true);
-    }
-    if (arduboy.justPressed(A_BUTTON)) startLevel();
-
-  } else {
-    // Crash / Win
-    if (arduboy.justPressed(DOWN_BUTTON)) toTitle();
-    else if (arduboy.justPressed(A_BUTTON)) startLevel();
-    else if (st == St::Win && arduboy.justPressed(RIGHT_BUTTON) &&
-             lvlIndex + 1 < LEVEL_COUNT) {
-      lvlIndex++;
-      startLevel();
-    }
+    arduboy.clear();
+    drawSplash();
+    arduboy.display();
+    return;
   }
+
+  switch (st) {
+    case St::Menu:    updateMenu();    break;
+    case St::Levels:  updateLevels();  break;
+    case St::Options: updateOptions(); break;
+    case St::Play:    updatePlay();    break;
+    default:          updateEnd();     break;
+  }
+
+  if (isMenuState(st)) menuMusic();
 
   // Червоний світлодіод миготить, поки лежимо.
   arduboy.digitalWriteRGB(RED_LED,
                           (st == St::Crash && ((tick >> 3) & 1)) ? RGB_ON : RGB_OFF);
 
-  updateCamera(false);
   arduboy.clear();
 
-  if (st == St::Title) {
-    drawTitle();
+  if (isMenuState(st)) {
+    if (st == St::Menu)        drawMenu();
+    else if (st == St::Levels) drawLevels();
+    else                       drawOptions();
     arduboy.display();
     return;
   }
 
+  updateCamera(false);
   drawTerrain();
   drawBike();
   drawHud();

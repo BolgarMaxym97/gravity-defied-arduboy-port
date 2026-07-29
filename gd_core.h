@@ -53,7 +53,10 @@ struct BikeTuning {
   fp wheelR;      // радіус колеса
   fp wheelBase;   // відстань між осями
   fp rollDrag;    // опір котіння на накаті (0..256, 256 = миттєвий стоп)
-  fp drive;       // сила газу
+  fp drive;       // номінальна сила газу (визначає максимальну швидкість)
+  fp torqueBoost; // у скільки разів більше моменту на нульовій швидкості, Q8
+  fp torqueKnee;  // швидкість, вище якої момент уже номінальний
+  fp grip;        // коефіцієнт зчеплення: стеля тяги = grip * притискна сила
   fp brake;       // гасіння дотичної швидкості при натиснутому B
   fp reverseGate; // нижче цієї швидкості B перемикається на задній хід
   fp reverse;     // тяга заднього ходу
@@ -77,6 +80,9 @@ constexpr BikeTuning DEFAULT_TUNING = {
   /*wheelBase*/        fpFromInt(15),
   /*rollDrag*/         8,          // ~3% за кадр; було 76 (30%) — це був ручник
   /*drive*/            22,
+  /*torqueBoost*/      560,        // ~2.2x на низах
+  /*torqueKnee*/       fpFromInt(3),
+  /*grip*/             470,        // ~1.8; менше — буксує на схилах
   /*brake*/            120,
   /*reverseGate*/      64,         // 0.25 px/кадр — практично стоїмо
   /*reverse*/          14,         // слабша за газ: задом не їздять швидко
@@ -117,6 +123,15 @@ struct Input {
   bool gas, brake, leanLeft, leanRight;
 };
 
+// Швидкість задається одним зрозумілим числом замість підбору drive навмання.
+//
+// Множник 2 не косметичний: газ прикладається лише до заднього колеса, а
+// зв'язок рами тут же ділить імпульс між двома масами. Тому без нього
+// реальна швидкість виходила рівно вдвічі меншою за заявлену в константі.
+inline fp driveForTopSpeed(uint8_t pxPerFrame, fp damping) {
+  return (fp)pxPerFrame * (FP_ONE - damping) * 2;
+}
+
 // --------------------------- Внутрішні хелпери -----------------------------
 
 // Найближча точка на відрізку AB до C. Все в Q8.
@@ -131,15 +146,34 @@ inline void closestOnSeg(fp ax, fp ay, fp bx, fp by, fp cx, fp cy, fp &qx, fp &q
   qy = ay + ((ey * t) >> FP_SHIFT);
 }
 
+// Крива моменту. На малих обертах реальний двигун дає більше моменту, ніж
+// на максимальних — саме цього бракувало, щоб заїжджати в гору. Вище
+// torqueKnee сила стала, тому максимальна швидкість лишається під контролем
+// drive і не роз'їжджається разом із тяговитістю.
+inline fp engineForce(const BikeTuning &tun, fp vt) {
+  if (vt >= tun.torqueKnee) return tun.drive;
+  if (vt < 0) vt = 0;
+  fp extra = (tun.drive * (tun.torqueBoost - FP_ONE)) >> FP_SHIFT;
+  return tun.drive + extra - (extra * vt) / tun.torqueKnee;
+}
+
+// Зчеплення. Тягу обмежує не двигун, а притискна сила: на крутому схилі
+// нормальна складова ваги менша, тож і тяги менше. Без цієї межі буст
+// моменту дозволив би їхати по вертикальній стіні.
+inline fp gripLimit(const BikeTuning &tun, fp ny) {
+  fp load = (-ny * tun.gravity) >> FP_SHIFT;   // ny < 0, коли поверхня знизу
+  if (load <= 0) return 0;
+  return (load * tun.grip) >> FP_SHIFT;
+}
+
 // Колізія одного колеса з ландшафтом. Повертає true при контакті
 // і віддає одиничну нормаль.
-inline bool resolveWheel(MassPoint &p, const Terrain &ter, const BikeTuning &tun,
-                         uint16_t &hint, fp &nx, fp &ny) {
+inline bool wheelTouch(MassPoint &p, const Terrain &ter, const BikeTuning &tun,
+                       uint16_t &hint, fp &nx, fp &ny) {
   int16_t wx = fpToInt(p.x);
   hint = ter.segAt(wx, hint);
 
   bool hit = false;
-  nx = 0; ny = -FP_ONE;
 
   // Вікно +-2 сегменти. +-1 вистачало на пологому рівні 1, але на крутих
   // схилах кілька коротких сегментів лягають майже на однакові x, і колесо
@@ -176,12 +210,46 @@ inline bool resolveWheel(MassPoint &p, const Terrain &ter, const BikeTuning &tun
   return hit;
 }
 
+// Колізія колеса з ландшафтом уздовж усього шляху за кадр, а не лише в
+// кінцевій точці.
+//
+// Це не перестраховка. З обриву в 98 px колесо набирає 4.3 px/кадр —
+// більше за свій радіус — і за один крок опиняється по інший бік землі,
+// де жоден сегмент його вже не бачить. Далі воно летить під ландшафтом до
+// самого фінішу. Перебірник знаходив цю дірку і «проходив» рівень за
+// 4 секунди; гравець провалився б так само, тільки випадково.
+inline bool resolveWheel(MassPoint &p, const Terrain &ter, const BikeTuning &tun,
+                         uint16_t &hint, fp &nx, fp &ny) {
+  nx = 0; ny = -FP_ONE;
+
+  const fp tgtX = p.x, tgtY = p.y;
+  const fp dx = p.x - p.px, dy = p.y - p.py;
+  const fp dist = fpLen(dx, dy);
+
+  uint8_t steps = 1;
+  if (dist > tun.wheelR) {
+    steps = (uint8_t)(dist / tun.wheelR) + 1;
+    if (steps > 8) steps = 8;          // стеля: далі це вже не фізика, а збій
+  }
+
+  if (steps == 1) return wheelTouch(p, ter, tun, hint, nx, ny);
+
+  for (uint8_t s = 1; s <= steps; s++) {
+    p.x = p.px + (dx * s) / steps;
+    p.y = p.py + (dy * s) / steps;
+    if (wheelTouch(p, ter, tun, hint, nx, ny)) return true;   // перший контакт
+  }
+
+  p.x = tgtX;
+  p.y = tgtY;
+  return false;
+}
+
 // Невидимі стіни на торцях траси. Без них заднім ходом можна виїхати за
 // x(0): segAt() затискає індекс на нульовому сегменті, closestOnSeg() чіпляє
 // його крайню точку, і колесо просто зісковзує з кута в порожнечу.
-// Ставимо стіну, а не «телепорт»: гасимо лише горизонтальну складову
-// швидкості (px = x), вертикальну лишаємо, інакше мотоцикл зависав би
-// в повітрі при ударі об стіну.
+// Гасимо лише горизонтальну складову швидкості (px = x), вертикальну
+// лишаємо, інакше мотоцикл зависав би в повітрі при ударі об стіну.
 inline void clampToWorld(MassPoint &p, const Terrain &ter, const BikeTuning &tun) {
   fp r = tun.wheelR;
   fp lo = fpFromInt(ter.x(0)) + r;
@@ -329,8 +397,11 @@ inline void bikeStep(Bike &b, const Terrain &ter, const BikeTuning &tun, const I
     fp vt = ((tx * vx + ty * vy) >> FP_SHIFT);
 
     if (in.gas) {
-      b.rear.px -= (tx * tun.drive) >> FP_SHIFT;
-      b.rear.py -= (ty * tun.drive) >> FP_SHIFT;
+      fp f = engineForce(tun, vt);
+      fp g = gripLimit(tun, nyR);
+      if (f > g) f = g;                        // буксування
+      b.rear.px -= (tx * f) >> FP_SHIFT;
+      b.rear.py -= (ty * f) >> FP_SHIFT;
     } else if (in.brake) {
       // B працює у три стадії: гальмо -> задній хід -> стеля заднього ходу.
       // Одночасно гальмувати й тягнути назад не можна: гасіння в гальмі
